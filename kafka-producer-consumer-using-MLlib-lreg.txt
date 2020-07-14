@@ -1,0 +1,92 @@
+
+val rdd = sc.textFile("wine_quality/winequality-red-noheader.csv").map(x => x.split(";"))
+ 
+val rdd1 = rdd.map(x => x.map(y => y.toDouble))
+ 
+import org.apache.spark.mllib.linalg.Vectors
+import org.apache.spark.mllib.regression.LabeledPoint
+
+val data = rdd1.map( r => {
+  val arr_size = r.size
+  val l = r(arr_size-1).toInt
+  val f = Array(r(0),r(1),r(7),r(8),r(9),r(10))
+  LabeledPoint(l,Vectors.dense(f))
+})
+
+data.cache
+
+val sets = data.randomSplit(Array(0.8,0.2))
+val trainSet = sets(0)
+val testSet = sets(1)
+
+trainSet.cache
+
+import org.apache.spark.mllib.regression.LinearRegressionWithSGD
+val alg = new LinearRegressionWithSGD()
+alg.setIntercept(true)
+alg.optimizer.setNumIterations(200)
+
+---- step size = 0.01
+alg.optimizer.setStepSize(0.01)
+val model = alg.run(trainSet)
+
+model.save(sc,"models/wine-quality")
+
+------------------------------------
+
+// Exemplo streaming com consumer kafka e producer kafka com Machine Learning
+
+import org.apache.kafka.common.serialization.StringDeserializer
+import org.apache.spark.streaming.kafka010.LocationStrategies.PreferConsistent
+import org.apache.spark.streaming.kafka010.ConsumerStrategies.Subscribe
+
+import org.apache.spark.streaming.StreamingContext; 
+import org.apache.spark.streaming.Seconds; 
+import org.apache.spark.streaming.kafka010.KafkaUtils; 
+
+val kafkaParams = Map[String, Object](
+  "bootstrap.servers" -> "ubkafka:9092",
+  "key.deserializer" -> classOf[StringDeserializer],
+  "value.deserializer" -> classOf[StringDeserializer],
+  "group.id" -> "use_a_separate_group_id_for_each_stream",
+  "auto.offset.reset" -> "latest",
+  "enable.auto.commit" -> (false: java.lang.Boolean)
+)
+
+val ssc = new StreamingContext(sc, Seconds(5))
+
+val topics = Array("test")
+
+val stream = KafkaUtils.createDirectStream[String, String](
+  ssc,
+  PreferConsistent,
+  Subscribe[String, String](topics, kafkaParams)
+)
+
+val result = stream.map(record => (record.key, record.value))
+
+import org.apache.spark.mllib.linalg.Vectors
+import org.apache.spark.mllib.regression.LinearRegressionModel
+
+val savedLinRegModel = LinearRegressionModel.load(sc,"models/wine-quality")
+
+import kfkProducerWrapper.KafkaProducerWrapper
+
+result.foreachRDD( rdd => {
+   val LRModel = savedLinRegModel
+   rdd.foreachPartition( iter => {
+     KafkaProducerWrapper.brokerList = "ubkafka:9092"
+     val producer = KafkaProducerWrapper.instance
+     val obs1 = iter.map(r => r._2.split(";").map(x => x.toDouble))
+     val vector = obs1.map(x => Vectors.dense(x(0), x(1), x(7), x(8), x(9), x(10)))
+     val pred = vector.map(x => LRModel.predict(x))
+     pred.foreach({ x => producer.send("metric", "key", x.toString) })
+   })
+ })
+ 
+sc.setCheckpointDir("/home/hadoop/checkpoint")
+
+ssc.start()
+
+
+
